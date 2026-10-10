@@ -1117,6 +1117,61 @@ fn zero_row_select_preserves_column_headers() {
 }
 
 #[test]
+fn get_triggers_lists_events_and_timing() {
+    let mut plugin = Plugin::with_scratch_database();
+    plugin.reset_table("trigger_target", "id INT NOT NULL PRIMARY KEY");
+    plugin.execute(format!(
+        "EXEC(N'CREATE TRIGGER [{TEST_SCHEMA}].[trg_target_audit] ON [{TEST_SCHEMA}].[trigger_target] \
+         AFTER INSERT, UPDATE AS SET NOCOUNT ON')"
+    ));
+
+    let triggers = plugin.call_ok(
+        "get_triggers",
+        json!({ "params": connection_params(), "schema": TEST_SCHEMA }),
+    );
+    let trigger = triggers
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "trg_target_audit")
+        .expect("trigger listed");
+    assert_eq!(trigger["table_name"], "trigger_target");
+    assert_eq!(trigger["event"], "INSERT OR UPDATE");
+    assert_eq!(trigger["timing"], "AFTER");
+
+    plugin.execute(format!("DROP TABLE [{TEST_SCHEMA}].[trigger_target]"));
+}
+
+#[test]
+fn metadata_introspection_works_at_compatibility_level_100() {
+    let mut plugin = Plugin::spawn();
+    let master = connection_params_for("master", "ss003-master");
+    plugin.execute_with(
+        &master,
+        "IF DB_ID(N'tabularis_compat100') IS NULL EXEC(N'CREATE DATABASE [tabularis_compat100]'); \
+         ALTER DATABASE [tabularis_compat100] SET COMPATIBILITY_LEVEL = 100",
+    );
+    let params = connection_params_for("tabularis_compat100", "ss003-compat100");
+    plugin.execute_with(
+        &params,
+        "DROP TABLE IF EXISTS dbo.legacy; CREATE TABLE dbo.legacy (id INT NOT NULL PRIMARY KEY)",
+    );
+
+    for (method, extra) in [
+        ("get_tables", json!({})),
+        ("get_columns", json!({ "table": "legacy" })),
+        ("get_all_columns_batch", json!({})),
+    ] {
+        let mut request = json!({ "params": params, "schema": "dbo" });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        plugin.call_ok(method, request);
+    }
+}
+
+#[test]
 fn multi_statement_and_batch_rpc_preserve_result_sets_and_temp_table_session() {
     let mut plugin = Plugin::with_scratch_database();
     let multi = plugin.execute(
@@ -1315,6 +1370,138 @@ fn pagination_and_batch_semantics_cover_ordered_unordered_cte_and_dml() {
 }
 
 #[test]
+fn explicit_row_limits_bypass_host_pagination_in_single_and_batch_queries() {
+    let mut plugin = Plugin::with_scratch_database();
+    let source = "(VALUES (1), (2), (3), (4), (5)) AS source(id)";
+    let cases = [
+        (
+            format!("SELECT TOP 3 id FROM {source} ORDER BY id"),
+            json!([[1], [2], [3]]),
+        ),
+        (
+            format!("SELECT DISTINCT TOP (3) id FROM {source} ORDER BY id; -- keep limit"),
+            json!([[1], [2], [3]]),
+        ),
+        (
+            format!("SELECT TOP (60) PERCENT id FROM {source} ORDER BY id"),
+            json!([[1], [2], [3]]),
+        ),
+        (
+            format!("SELECT TOP (3) WITH TIES id FROM {source} ORDER BY id"),
+            json!([[1], [2], [3]]),
+        ),
+        (
+            format!("WITH cte AS (SELECT id FROM {source}) SELECT TOP (3) id FROM cte ORDER BY id"),
+            json!([[1], [2], [3]]),
+        ),
+        (
+            format!("SELECT id FROM {source} ORDER BY id OFFSET 2 ROWS"),
+            json!([[3], [4], [5]]),
+        ),
+        (
+            format!("SELECT id FROM {source} ORDER BY id OFFSET 1 ROWS FETCH NEXT 3 ROWS ONLY"),
+            json!([[2], [3], [4]]),
+        ),
+    ];
+
+    for (query, expected_rows) in &cases {
+        let result = plugin.call_ok(
+            "execute_query",
+            json!({ "params": connection_params(), "query": query, "limit": 1, "page": 2 }),
+        );
+        assert_eq!(result["rows"], *expected_rows, "{query}");
+        assert_eq!(result["pagination"], Value::Null, "{query}");
+        assert_eq!(result["truncated"], false, "{query}");
+    }
+
+    let queries: Vec<_> = cases.iter().map(|(query, _)| query).collect();
+    let batch = plugin.call_ok(
+        "execute_query_batch",
+        json!({ "params": connection_params(), "queries": queries, "limit": 1, "page": 2 }),
+    );
+    for (index, (query, expected_rows)) in cases.iter().enumerate() {
+        assert_eq!(batch[index]["result"]["rows"], *expected_rows, "{query}");
+        assert_eq!(batch[index]["result"]["pagination"], Value::Null, "{query}");
+        assert_eq!(batch[index]["result"]["truncated"], false, "{query}");
+    }
+}
+
+#[test]
+fn generated_select_template_executes_without_conflicting_host_pagination() {
+    let mut plugin = Plugin::with_scratch_database();
+    plugin.reset_table("query_templates", "id INT PRIMARY KEY, label NVARCHAR(30)");
+    plugin.execute(format!(
+        "INSERT INTO [{TEST_SCHEMA}].[query_templates] VALUES (1, N'one'), (2, N'two'), (3, N'three')"
+    ));
+    let template = plugin.call_ok(
+        "get_table_query_template",
+        json!({
+            "params": connection_params(),
+            "request": { "table": "query_templates", "schema": TEST_SCHEMA,
+                         "kind": "select", "columns": ["id", "label"], "limit": 2 }
+        }),
+    );
+    assert!(template.as_str().unwrap().starts_with("SELECT TOP (2)"));
+    let result = plugin.call_ok(
+        "execute_query",
+        json!({ "params": connection_params(), "query": template, "limit": 1, "page": 4 }),
+    );
+    assert_eq!(result["columns"], json!(["id", "label"]));
+    assert_eq!(result_rows(&result).len(), 2);
+    assert_eq!(result["pagination"], Value::Null);
+    assert_eq!(result["truncated"], false);
+}
+
+#[test]
+fn generated_templates_escape_identifiers_and_guard_writes() {
+    let mut plugin = Plugin::with_scratch_database();
+    let table = "query]template_guards";
+    let target = format!("[{TEST_SCHEMA}].{}", bracket_quote(table));
+    plugin.execute(format!(
+        "DROP TABLE IF EXISTS {target}; \
+         CREATE TABLE {target} (id INT PRIMARY KEY, [a b] INT, [a-b] INT, [order]]status] NVARCHAR(30)); \
+         INSERT INTO {target} VALUES (1, 2, 3, N'open')"
+    ));
+    let baseline = plugin.execute(format!("SELECT * FROM {target} ORDER BY id"));
+
+    let mut templates = Vec::new();
+    for kind in ["select", "update", "delete"] {
+        let template = plugin.call_ok(
+            "get_table_query_template",
+            json!({
+                "params": connection_params(),
+                "request": { "table": table, "schema": TEST_SCHEMA, "kind": kind,
+                             "columns": ["id", "a b", "a-b", "order]status"] }
+            }),
+        );
+        let sql = template.as_str().unwrap().to_string();
+        assert!(sql.contains(&target));
+        templates.push(sql);
+    }
+    // Generating previews must not execute them or change the table.
+    let after_preview = plugin.execute(format!("SELECT * FROM {target} ORDER BY id"));
+    assert_eq!(after_preview["rows"], baseline["rows"]);
+    let selected = plugin.execute(&templates[0]);
+    assert_eq!(selected["rows"], baseline["rows"]);
+    assert_eq!(selected["columns"], baseline["columns"]);
+
+    assert_eq!(templates[1].matches(":value_").count(), 4);
+    // Simulate the editor filling its named placeholders with SQL literals.
+    let update = templates[1]
+        .replace(":value_1", "999")
+        .replace(":value_2", "20")
+        .replace(":value_3", "30")
+        .replace(":value_4", "N'closed'");
+    for sql in [update, templates[2].clone()] {
+        assert!(sql.ends_with("WHERE 1 = 0;"));
+        let result = plugin.execute(sql);
+        assert_eq!(result["affected_rows"], 0);
+    }
+    let after_writes = plugin.execute(format!("SELECT * FROM {target} ORDER BY id"));
+    assert_eq!(after_writes["rows"], baseline["rows"]);
+}
+
+#[test]
 fn million_row_query_is_bounded_and_marks_truncation() {
     let mut plugin = Plugin::with_scratch_database();
     let result = plugin.execute(
@@ -1419,6 +1606,69 @@ fn syntax_and_constraint_errors_keep_server_details_and_pool_recovery() {
         "SELECT COUNT(*) AS row_count FROM [{TEST_SCHEMA}].[errors]"
     ));
     assert_eq!(after_constraint["rows"], json!([[1]]));
+}
+
+// Issue #37: a runtime error followed by a result set in the same batch used to
+// surface as "Expected ColumnMetadata in context" (or hang) instead of the
+// server error. insert_record/update_record always hit this shape because they
+// append `SELECT @@ROWCOUNT` after the DML.
+#[test]
+fn runtime_error_followed_by_result_set_returns_server_error() {
+    let mut plugin = Plugin::with_scratch_database();
+    plugin.reset_table(
+        "runtime_errors",
+        "id INT PRIMARY KEY, value INT NOT NULL CHECK (value >= 0)",
+    );
+    plugin.execute(format!(
+        "INSERT INTO [{TEST_SCHEMA}].[runtime_errors] VALUES (1, 1)"
+    ));
+
+    let query_error = plugin.call_error(
+        "execute_query",
+        json!({ "params": connection_params(), "query": "SELECT 1/0; SELECT 2" }),
+    );
+    assert!(
+        query_error.starts_with("SQL Server error 8134:"),
+        "{query_error}"
+    );
+
+    let update_error = plugin.call_error(
+        "update_record",
+        json!({
+            "params": connection_params(), "schema": TEST_SCHEMA, "table": "runtime_errors",
+            "pk_map": { "id": 1 }, "col_name": "value", "new_val": -1
+        }),
+    );
+    assert!(
+        update_error.starts_with("SQL Server error 547:"),
+        "{update_error}"
+    );
+
+    let insert_error = plugin.call_error(
+        "insert_record",
+        json!({
+            "params": connection_params(), "schema": TEST_SCHEMA, "table": "runtime_errors",
+            "data": { "id": 2, "value": -1 }
+        }),
+    );
+    assert!(
+        insert_error.starts_with("SQL Server error 547:"),
+        "{insert_error}"
+    );
+
+    // The same shape must stay quiet when nothing fails.
+    let updated = plugin.call_ok(
+        "update_record",
+        json!({
+            "params": connection_params(), "schema": TEST_SCHEMA, "table": "runtime_errors",
+            "pk_map": { "id": 1 }, "col_name": "value", "new_val": 5
+        }),
+    );
+    assert_eq!(updated, json!(1));
+    let rows = plugin.execute(format!(
+        "SELECT id, value FROM [{TEST_SCHEMA}].[runtime_errors] ORDER BY id"
+    ));
+    assert_eq!(rows["rows"], json!([[1, 5]]));
 }
 
 #[test]
