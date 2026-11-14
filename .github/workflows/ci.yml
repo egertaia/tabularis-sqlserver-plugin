@@ -56,8 +56,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          # pnpm 11.23 requires Node 22.13 or newer.
-          node-version: "22.13"
+          # tsup 9 requires Node 22.18 or newer on the Node 22 line.
+          node-version: "22.18"
 
       - name: Install dependencies
         working-directory: explain
@@ -84,7 +84,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: "22.13"
+          node-version: "22.18"
 
       - name: Install dependencies
         working-directory: ui
@@ -297,6 +297,16 @@ jobs:
 
             const prNumber = context.payload.pull_request.number;
 
+            // Fork PR tokens are read-only. Keep the suggestion visible in the
+            // job summary without attempting to write a PR comment.
+            if (context.payload.pull_request.head.repo.full_name !== context.payload.pull_request.base.repo.full_name) {
+              const message = classification === "none"
+                ? `No release needed for this PR (${type}).`
+                : `Current: ${baselineStr}\n\nSuggested next tag: v${computeNextVersion(baselineStr, classification, channel)}`;
+              await core.summary.addHeading("Version suggestion").addRaw(message).write();
+              return;
+            }
+
             // Find our most recent, not-yet-minimized comment on this PR.
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
@@ -402,4 +412,15 @@ jobs:
           # not enable it (`cargo tree -i rkyv` has no path), so no rkyv code
           # is compiled into the shipped binary. Re-check whenever
           # rust_decimal is upgraded or its enabled features change.
-          ignore: RUSTSEC-2026-0235
+          # RUSTSEC-2023-0071 affects rsa 0.10.0-rc.18 (Marvin timing
+          # side channel, no patched release). sspi depends on picky, which
+          # depends on rsa, with no feature gate. The NTLM path never
+          # performs RSA private-key operations, so the timing leak is not
+          # reachable from this plugin. Re-check when sspi drops picky or
+          # rsa ships a fix.
+          # RUSTSEC-2026-0441 is a maintenance notice with no patched
+          # release, not a disclosed vulnerability. On macOS/iOS, sspi
+          # pulls pin-utils through async-dnssd; NTLM does not use DNS-SD.
+          # Accept this transitive maintenance risk until sspi/async-dnssd
+          # removes pin-utils. Re-check on either dependency upgrade (#63).
+          ignore: RUSTSEC-2026-0235,RUSTSEC-2023-0071,RUSTSEC-2026-0441

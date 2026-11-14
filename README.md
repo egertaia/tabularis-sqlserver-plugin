@@ -1,6 +1,15 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/public/logo-sm.png" width="120" height="120" alt="Tabularis logo" />
-  <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/sqlserver-icon.svg" width="120" height="120" alt="SQL Server plugin icon" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis/main/.github/assets/banner-dark.png" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis/main/.github/assets/banner-light.png" alt="tabularis — the database client your AI agent can actually use" width="600" />
+  </picture>
+
+  <br/>
+
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/assets/sqlserver-banner-dark.png" />
+    <img src="https://raw.githubusercontent.com/TabularisDB/tabularis-sqlserver-plugin/main/assets/sqlserver-banner-light.png" alt="Native SQL Server support" width="600" />
+  </picture>
 </div>
 
 # tabularis-sqlserver-plugin
@@ -18,14 +27,12 @@ A [Microsoft SQL Server](https://www.microsoft.com/sql-server) plugin for [Tabul
 
 This plugin enables Tabularis to connect to SQL Server instances, providing schema introspection, query execution, full CRUD, DDL, trigger and stored-routine management, BLOB handling, database-user management, and visual execution plans through a JSON-RPC 2.0 over stdio interface. It is written in Rust on top of Microsoft's [`mssql-tds`](https://github.com/microsoft/mssql-rust) protocol implementation (via [`mssql-tiberius-bridge`](https://crates.io/crates/mssql-tiberius-bridge)) with [`deadpool`](https://crates.io/crates/deadpool) connection pooling.
 
-> **Requires Tabularis v0.24.1-2 or later.** This plugin relies on raw plugin
-> EXPLAIN output and plugin-provided parser bundle loading (v0.23.0) plus the
-> connection-modal credential-hiding hook from
-> [TabularisDB/tabularis#780](https://github.com/TabularisDB/tabularis/pull/780),
-> first shipped in nightly
-> [nightly-20260918-992d969](https://github.com/TabularisDB/tabularis/releases/tag/nightly-20260918-992d969)
-> (app version `0.24.1-2`). Do not publish this candidate before a compatible
-> host is available.
+> **Requires Tabularis v0.25.1-5 or later.** Plugin v1.0.0-beta.4 pairs native
+> SQL Server Generate SQL previews with the host extension from
+> [TabularisDB/tabularis#818](https://github.com/TabularisDB/tabularis/pull/818).
+> Update both the app and the plugin to get the complete TOP/LIMIT fix.
+> The target host is nightly `0.25.1-5` or the following stable release;
+> earlier hosts should remain on plugin v1.0.0-beta.2.
 
 **Discord** — [Join our Discord server](https://discord.com/invite/K2hmhfHRSt) and chat with the maintainers.
 
@@ -55,6 +62,7 @@ This plugin enables Tabularis to connect to SQL Server instances, providing sche
 - Microsoft's `mssql-tds` protocol implementation through `mssql-tiberius-bridge`, with `deadpool` connection pooling, session reset (`sp_reset_connection`), startup scripts, and pool lifecycle handling
 - Schema, table, column, PK/FK, index, view, routine, and trigger introspection
 - Query execution with pagination, CTE/DML classification, multiple result sets, and session-preserving batches
+- Driver-owned SELECT/UPDATE/DELETE previews on hosts supporting optional [SQL templates](docs/query-templates.md), including SQL Server `TOP` syntax
 - Accurate affected rows, including multi-statement DML and DML `OUTPUT`
 - INSERT/UPDATE/DELETE with composite primary keys and safe `IDENTITY_INSERT` recovery
 - Table/view/index/foreign-key DDL and safe `ALTER COLUMN` generation
@@ -85,7 +93,7 @@ This plugin enables Tabularis to connect to SQL Server instances, providing sche
 | `host` | `localhost` | Yes unless using `connection_string` | SQL Server hostname or IP address |
 | `port` | `1433` | No | TDS port |
 | `database` | — | Yes unless using `connection_string` | Database the pool connects to |
-| `username` | `sa` | Yes, unless integrated authentication is enabled or `connection_string` is used | SQL-authenticated login |
+| `username` | `sa` | Yes, unless integrated authentication is enabled or `connection_string` is used | SQL-authenticated login, or `DOMAIN\user` / `user@domain` with NTLM |
 | `password` | — | If required by the server | Login password; redacted from connection errors |
 | `ssl_mode` | `prefer` | No | `disable`, `prefer`, `require`, or `verify-full` |
 | `ssl_ca` | — | No | Rejected; strict TLS uses the system trust store |
@@ -128,6 +136,19 @@ runtime via `dlopen`. The binary builds and starts without it, but connecting
 fails at runtime if `libgssapi_krb5` (package `libgssapi-krb5-2` on
 Debian/Ubuntu, `krb5-libs` on RHEL/Alpine) is missing, or without a valid
 Kerberos ticket (`kinit`) and `/etc/krb5.conf`.
+
+### NTLM authentication
+
+The second checkbox, "Use NTLM", writes `extra.ntlm = "true"` and keeps the
+username/password inputs. Enter the username as `DOMAIN\user` or
+`user@domain`. The plugin then authenticates with NTLM through the pure-Rust
+[`sspi`](https://crates.io/crates/sspi) crate on every platform, so Linux and
+macOS need no Kerberos setup or system library. It plugs into mssql-tds'
+`SecurityContextProvider` hook ([microsoft/mssql-rs#707](https://github.com/microsoft/mssql-rs/issues/707)).
+
+NTLM cannot be combined with integrated authentication, and it requires a
+username. Channel bindings (Extended Protection) are not sent, so servers
+that require Extended Protection reject it.
 
 A connection string may be combined with discrete fields. Values explicitly
 present in the string are authoritative, while discrete fields fill only
@@ -320,6 +341,9 @@ status is tracked in [issue #4](https://github.com/TabularisDB/tabularis-sqlserv
 
 ### Manual Installation
 
+macOS packages require macOS 10.15 or later on Intel, or macOS 11 or later on
+Apple Silicon.
+
 Once release assets are available:
 
 1. Download the ZIP for your platform from the [releases page](https://github.com/TabularisDB/tabularis-sqlserver-plugin/releases).
@@ -364,7 +388,7 @@ remaining pools.
 
 ## Known Limitations
 
-- SQL authentication and Windows/Kerberos integrated authentication (`integrated_auth`) are supported; Azure AD authentication is follow-up work.
+- SQL authentication, Windows/Kerberos integrated authentication (`integrated_auth`) and NTLM (`ntlm`) are supported; Azure AD authentication is follow-up work.
 - Primary-key membership changes are disabled: the single-column alteration API cannot safely preserve composite PKs and referencing foreign keys.
 - Custom CA files are rejected explicitly; strict verification uses the system trust store.
 - SQL Server has indexed views, not materialized views. Indexed views are maintained synchronously and have no refresh operation, so `get_materialized_views`, `get_materialized_view_columns`, `get_materialized_view_definition`, and `refresh_materialized_view` deliberately return `-32601` rather than pretending the features are equivalent.

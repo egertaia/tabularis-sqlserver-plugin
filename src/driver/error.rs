@@ -20,15 +20,19 @@ pub fn format_bridge_error(error: &BridgeError, ssl_mode: Option<&str>) -> Strin
         }
         BridgeError::ColumnNotFound(_)
         | BridgeError::ColumnIndexOutOfBounds { .. }
-        | BridgeError::Conversion(_) => format!("SQL Server data conversion failure: {error}"),
+        | BridgeError::Conversion(_)
+        | BridgeError::BulkInput(_) => format!("SQL Server data conversion failure: {error}"),
         BridgeError::Pool(message) => format!("SQL Server connection-pool failure: {message}"),
+        BridgeError::InvalidPreparedStatement => {
+            format!("SQL Server driver failure: {error}")
+        }
     }
 }
 
 /// Format errors from the underlying Microsoft TDS client.
 pub fn format_tds_error(error: &TdsError, ssl_mode: Option<&str>) -> String {
     match error {
-        TdsError::SqlServerError { errors } => format_server_errors(errors),
+        TdsError::SqlServerError { diagnostics } => format_server_errors(&diagnostics.errors),
         TdsError::TlsError(_)
         | TdsError::TlsHandshakeError { .. }
         | TdsError::CertificateNotFound { .. }
@@ -54,8 +58,14 @@ pub fn format_tds_error(error: &TdsError, ssl_mode: Option<&str>) -> String {
         | TdsError::ImplementationError(_)
         | TdsError::UnimplementedFeature { .. }
         | TdsError::TypeConversionError(_)
+        | TdsError::EncodedValueTooLong { .. }
+        | TdsError::TvpCellSerialization { .. }
         | TdsError::UnsupportedEncoding { .. }
-        | TdsError::BulkCopyError(_) => format!("SQL Server driver failure: {error}"),
+        | TdsError::BulkCopyError(_)
+        | TdsError::ColumnEncryptionError(_) => format!("SQL Server driver failure: {error}"),
+        TdsError::ConnectionResetNotAcknowledged => {
+            format!("SQL Server connection failure: {error}")
+        }
     }
 }
 
@@ -111,6 +121,7 @@ pub fn bridge_error_requires_discard(error: &BridgeError) -> bool {
                 | TdsError::ConnectionError(_)
                 | TdsError::SqlServerError { .. }
                 | TdsError::ConnectionClosed(_)
+                | TdsError::ConnectionResetNotAcknowledged
                 | TdsError::ProtocolError(_)
                 | TdsError::TlsError(_)
                 | TdsError::TlsHandshakeError { .. }
@@ -231,6 +242,28 @@ mod tests {
     }
 
     #[test]
+    fn unacknowledged_session_reset_is_reported_and_discarded() {
+        let error = BridgeError::Tds(TdsError::ConnectionResetNotAcknowledged);
+
+        assert!(format_bridge_error(&error, None).contains("SQL Server connection failure"));
+        assert!(bridge_error_requires_discard(&error));
+        assert!(!bridge_error_requires_discard(
+            &BridgeError::InvalidPreparedStatement
+        ));
+    }
+
+    #[test]
+    fn bulk_input_failure_preserves_details_without_discarding_connection() {
+        let error = BridgeError::BulkInput("wrong column count".into());
+
+        assert_eq!(
+            format_bridge_error(&error, None),
+            "SQL Server data conversion failure: BULK UPLOAD input failure: wrong column count"
+        );
+        assert!(!bridge_error_requires_discard(&error));
+    }
+
+    #[test]
     fn tls_error_names_mode_and_action() {
         let error = BridgeError::Tds(TdsError::CertificateMismatch);
         let message = format_bridge_error(&error, Some("verify-full"));
@@ -240,20 +273,49 @@ mod tests {
     }
 
     #[test]
+    fn serialization_errors_preserve_size_and_cell_context() {
+        let error = BridgeError::Tds(TdsError::EncodedValueTooLong {
+            actual: 256,
+            maximum: 128,
+        });
+        let message = format_bridge_error(&error, None);
+        assert!(message.starts_with("SQL Server driver failure:"));
+        assert!(message.contains("256 bytes"));
+        assert!(message.contains("128 bytes"));
+        assert!(!bridge_error_requires_discard(&error));
+
+        let error = BridgeError::Tds(TdsError::TvpCellSerialization {
+            parameter: mssql_tds::error::TvpParameterRef::RpcPosition(2),
+            row: 3,
+            column: 4,
+            source: Box::new(TdsError::EncodedValueTooLong {
+                actual: 256,
+                maximum: 128,
+            }),
+        });
+        let message = format_bridge_error(&error, None);
+        assert!(message.starts_with("SQL Server driver failure:"));
+        assert!(message.contains("RPC position 2, row 3, column 4"));
+        assert!(message.contains("256 bytes"));
+        assert!(!bridge_error_requires_discard(&error));
+    }
+
+    #[test]
     fn redaction_removes_password_and_connection_string() {
-        let connection_string = "Server=db;User Id=sa;Password=NeverExposeThis!;Encrypt=true";
+        let secret = crate::common::random_secret();
+        let connection_string = format!("Server=db;User Id=sa;Password={secret};Encrypt=true");
         let params = ConnectionParams {
-            password: Some("NeverExposeThis!".into()),
-            connection_string: Some(connection_string.into()),
+            password: Some(secret.clone()),
+            connection_string: Some(connection_string.clone()),
             database: DatabaseSelection::Single("master".into()),
             ..Default::default()
         };
         let message = redact_connection_secrets(
-            format!("failed with NeverExposeThis! from {connection_string}"),
+            format!("failed with {secret} from {connection_string}"),
             &params,
         );
-        assert!(!message.contains("NeverExposeThis!"));
-        assert!(!message.contains(connection_string));
+        assert!(!message.contains(&secret));
+        assert!(!message.contains(&connection_string));
         assert!(message.contains("<redacted>"));
     }
 }

@@ -39,8 +39,8 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          # pnpm 11.23 requires Node 22.13 or newer.
-          node-version: "22.13"
+          # tsup 9 requires Node 22.18 or newer on the Node 22 line.
+          node-version: "22.18"
 
       # Typecheck and test the parser before any platform binary is built so a
       # broken parser fails the whole release instead of only the npm half.
@@ -71,12 +71,14 @@ jobs:
             binary-suffix: ""
             cross: true
           - platform-label: darwin-x64
-            runner: macos-latest
+            runner: macos-15-intel
+            macos-deployment-target: "10.15"
             target: x86_64-apple-darwin
             archive: zip
             binary-suffix: ""
           - platform-label: darwin-arm64
-            runner: macos-14
+            runner: macos-15
+            macos-deployment-target: "11.0"
             target: aarch64-apple-darwin
             archive: zip
             binary-suffix: ""
@@ -126,8 +128,8 @@ jobs:
         if: steps.ui.outputs.present == 'true' || steps.explain.outputs.present == 'true'
         uses: actions/setup-node@v7
         with:
-          # pnpm 11.23 requires Node 22.13 or newer.
-          node-version: "22.13"
+          # tsup 9 requires Node 22.18 or newer on the Node 22 line.
+          node-version: "22.18"
 
       - name: Build UI
         if: steps.ui.outputs.present == 'true'
@@ -155,6 +157,10 @@ jobs:
 
       - name: Build
         if: ${{ !matrix.cross }}
+        env:
+          # mssql-tds Network.framework TLS requires macOS 10.15+.
+          # Apple Silicon starts at macOS 11; Linux/Windows leave this unset.
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos-deployment-target }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package (unix)
@@ -225,7 +231,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: "22.13"
+          node-version: "22.18"
           registry-url: "https://registry.npmjs.org"
 
       # npm never accepts a second publish of an existing version, so a re-run
@@ -251,12 +257,13 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
+      # Authenticates through npm Trusted Publishing (OIDC, `id-token: write`
+      # above) configured on npmjs.com for this repository and release.yml;
+      # no npm token secret is involved.
       - name: Publish
         if: steps.npm.outputs.published == 'false'
         working-directory: explain
         run: pnpm publish --access public --provenance --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   release:
     name: Publish GitHub release

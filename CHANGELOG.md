@@ -7,6 +7,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-10
+
+### Added
+
+- NTLM authentication with `DOMAIN\user` and password on every platform,
+  including Linux and macOS (`extra.ntlm`, "Use NTLM" checkbox).
+
+### Changed
+
+- Upgrade Microsoft's `mssql-tiberius-bridge` to 0.3.0 and `mssql-tds` to 0.4.0.
+- Update OpenSSL, UUID and the EXPLAIN parser's development dependencies.
+
+### Security
+
+- Document an audit exception for RUSTSEC-2026-0441: `pin-utils` is
+  unmaintained and has no patched release. It is pulled in by `sspi` through
+  `async-dnssd` on macOS/iOS; the plugin does not use its pinning macros
+  directly. Revisit the exception when those upstream dependencies migrate.
+  The transitive maintenance risk remains accepted (#63).
+
+## [1.0.0-beta.4] - 2026-10-25
+
+### Changed
+
+- Upgrade Microsoft's `mssql-tiberius-bridge` and `mssql-tds` to 0.2.0 (#38).
+- Update Tokio, UUID, serde_json and the EXPLAIN package's development tools.
+- Declare the stable plugin id and display name in the registry manifest (#43).
+
+### Fixed
+
+- Correct LOGIN7 Unicode field lengths through the protocol upgrade, allowing
+  non-ASCII login names and passwords (#51).
+- Support explicit transaction batches, including minimal `BEGIN TRANSACTION;
+  COMMIT TRANSACTION;`, through the protocol upgrade (#44).
+- Preserve SQL Server runtime errors followed by result sets (#37, #39).
+- Read triggers and metadata on databases below compatibility level 110 (#34).
+- Explicitly include Node types when checking EXPLAIN tests with Vitest 5.
+
+### Tests
+
+- Add live JSON-RPC regressions for committed transaction batches and Unicode
+  authentication across `disable`, `preferred` and `require` TLS modes.
+
+## [1.0.0-beta.3] - 2026-09-29
+
+### Added
+
+- Opt-in `get_table_query_template` RPC for driver-owned SELECT, UPDATE and
+  DELETE previews, with SQL Server `TOP`, schema qualification and identifier
+  quoting (#26).
+- Live SQL Server regression coverage and a reusable desktop fixture for
+  escaped identifiers, unique UPDATE placeholders and guarded writes.
+
+### Changed
+
+- Require Tabularis `0.25.1-5` or newer so this release's Generate SQL fix is
+  paired with the host extension from Tabularis PR #818. The optional RPC is
+  backward-compatible, but this release intentionally gates installation on
+  a host that implements the complete fix.
+
+### Fixed
+
+- Preserve explicit outer `TOP` and `OFFSET/FETCH` limits instead of adding
+  incompatible automatic pagination (#26). Limits inside CTEs and subqueries
+  still allow pagination of the outer query.
+
 ## [1.0.0-beta.2] - 2026-09-21
 
 ### Added
@@ -100,6 +166,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regression coverage for pool identity, million-row truncation and concurrent
   responsiveness.
 
-[Unreleased]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/compare/v1.0.0-beta.2...HEAD
+[Unreleased]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/compare/v1.0.0-beta.4...v1.0.1
+[1.0.0-beta.4]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/compare/v1.0.0-beta.3...v1.0.0-beta.4
+[1.0.0-beta.3]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/compare/v1.0.0-beta.2...v1.0.0-beta.3
 [1.0.0-beta.2]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/compare/v1.0.0-beta.1...v1.0.0-beta.2
 [1.0.0-beta.1]: https://github.com/TabularisDB/tabularis-sqlserver-plugin/releases/tag/v1.0.0-beta.1
